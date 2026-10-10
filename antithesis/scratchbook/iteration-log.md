@@ -441,7 +441,7 @@ restored at 83 s). One timeline only, and none in the Tier 0-only runs.
 
 The workload has no properties, so nothing in it "caught" this: the
 built-in container-exit check did. It's written up with the moment,
-timeline and hypotheses in `findings/etcd2-fatal-range-revision-pair.md` and
+timeline and hypotheses in `findings/txn-from-key-delete-crash.md` and
 was not encoded in the workload (per the skill's rules). The ingredients all
 came from Tier 1 drivers: compaction at the current revision, multi-key
 deletes/txns at one revision, txns with inner prefix ranges.
@@ -477,7 +477,7 @@ Final `snouty validate antithesis/config` on freshly built normal images:
 
 Active: Tier 0, Tier 1, Tier 2 `lease`: 11 drivers. Two changes undone
 (rows 8 and 9). Four Antithesis runs (30 min each): three triaged healthy
-apart from one **etcd crash** (`findings/etcd2-fatal-range-revision-pair.md`);
+apart from one **etcd crash** (`findings/txn-from-key-delete-crash.md`);
 run 4 (`fb7e3f1fd12a5c417bfed2ecddf840dc-64-0`) not yet triaged.
 
 What helped most, in order: **adding operations** (Tier 1, then lease) by
@@ -514,3 +514,81 @@ What got in the way:
 5. Review findings not yet tried: revisions relative to the current one
    (#3), per-process value-size regimes (#5), abandoning some streams
    early (#6).
+
+## 5. Run 4 triage and the crash investigation
+
+Run 4 (`fb7e3f1fd12a5c417bfed2ecddf840dc-64-0`, Tier 0 + 1 + lease). All
+infrastructure properties pass (instrumentation, symbols, no Antithesis
+errors) and every driver ran without failing, but `container: etcd0/1/2,
+exit code: 2` failed 21 times across 10 timelines. Exit code 2 is a Go panic
+(run 3's single crash was exit code 1, `lg.Fatal`).
+
+How it was investigated, in order:
+
+1. **Per-timeline logs** (`snouty runs --json logs` for two counterexample
+   moments). In both, *every* member logged the same panic within a
+   millisecond: `index out of range [0] with length 0` in `server_applyAll`
+   → `txn.put` (`txn/put.go:55`) ← `executeTxn`. The whole cluster crashing
+   on the same committed raft entry pointed at the SUT, not at a fault.
+2. **Reading the code.** `put.go:55` is `val = prevKV.KVs[0].Value` under
+   `ignore_value`. Txns check `ignore_*` puts up front (`checkPut` →
+   `ErrKeyNotFound`), but against the state *before* the txn runs, while ops
+   execute in order. Something in the same txn must have deleted the key
+   first, and `checkIntervals` is supposed to forbid exactly that. It does
+   handle prefix deletes but not `range_end = "\x00"`: its interval tree uses
+   `""` for +∞, so `[key, "\x00")` is an empty interval that overlaps nothing.
+3. **Local repro of the hypothesis.** One txn,
+   `[delete_range(key00, "\x00"), put(key05, ignore_value=true)]`, crashed all
+   three local members with the identical panic. Then the checks that turn
+   "crash" into "SUT bug":
+   - no faults (local), so not fault injection;
+   - the uninstrumented coverage build also crashes, so not instrumentation;
+   - official etcd **v3.6.0 and v3.5.17** crash too (with
+     `applyTxn: failed Put: key not found` → deliberate panic), so it's an
+     old bug, not a `main` regression;
+   - restarting the members crashes them again (WAL replay), so the cluster
+     is permanently down.
+4. **Run 3's fatal turned out to be the same bug.** The same hole lets a txn
+   delete and re-put one key at a single revision. In `keyIndex.compact`,
+   compacting at exactly that revision keeps the new generation in the index
+   but leaves its revision out of the backend's keep set. Local repro (txn,
+   compact at its revision, read the key): exactly run 3's
+   `range failed to find revision pair`, killing only the member serving
+   the read (exit 1). Reading the key on another member killed that one too,
+   so the corruption is on every replica.
+5. **Cross-timeline check.** The query-logs skill needs `agent-browser`, which
+   isn't installed here, so it wasn't used. The multiverse debugger skill is
+   browser-based too, and with local repros it wasn't needed. Instead,
+   `snouty runs events` (server-side search over all timelines) for every
+   panic and fatal: run 4 has 22 panics, all this signature (9 ×
+   `ignore_value` at `put.go:55`, 13 × `ignore_lease` at `put.go:58`, 3 via
+   a nested txn), and nothing else. Run 3 has the single fatal. Every
+   container exit in both runs is explained. All three variants
+   (`ignore_lease`, nested txn, delete-all-keys `("\x00","\x00")`) were also
+   reproduced locally.
+6. **Root cause confirmed with a fix.** In a scratch copy of etcd (not this
+   checkout), mapping `"\x00"` to `""` in `checkIntervals` makes every repro
+   fail with `ErrGRPCDuplicateKey` and the server stay up.
+
+**Verdict: both crashes are real etcd bugs with one root cause. Neither is a
+harness false positive.** Write-up, repro scripts and the candidate fix:
+`findings/txn-from-key-delete-crash.md`, `findings/repro/`.
+
+Why the workload found it: `kv.txn` builds inner ops from the same
+`pick_range()` menu as `kv.delete_range`, which includes from-key and
+all-keys deletes, and since iteration 7 its inner puts use the full
+`PUT_OPTIONS` (with `ignore_value`/`ignore_lease`). Iteration 7, the one
+that dropped txn ok from 51% to 28% and that iteration 8 tried to undo, is
+what made run 4 hit this so often (run 3, before iteration 7, hit only the
+compaction variant, once). The review's suggestion to give inner ops the
+standalone menus paid off, though not in a way the coverage numbers showed.
+
+### Fix applied, run 5
+
+At the user's request the fix went into the checkout
+(`server/etcdserver/api/v3rpc/key.go`, 5 lines: `range_end == "\x00"` maps
+to `""`, the interval tree's +∞). `gofmt`/`go vet` clean; `go test
+./etcdserver/api/v3rpc/` passes. With the rebuilt instrumented image, both
+local repros are rejected with `duplicate key given in txn request` and all
+members stay healthy. Run 5 (`a9d5dfcdfd77505dcc64d343f436d807-64-0`, 30 min)
+uses exactly run 4's drivers, so the SUT fix is the only difference.

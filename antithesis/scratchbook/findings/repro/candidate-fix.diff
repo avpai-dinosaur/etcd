@@ -1,0 +1,16 @@
+--- a/server/etcdserver/api/v3rpc/key.go	2026-10-09 19:54:17.177228761 +0000
++++ b/server/etcdserver/api/v3rpc/key.go	2026-10-10 03:01:01.290549237 +0000
+@@ -248,7 +248,12 @@
+ 		}
+ 		var iv adt.Interval
+ 		if len(dreq.RangeEnd) != 0 {
+-			iv = adt.NewStringAffineInterval(string(dreq.Key), string(dreq.RangeEnd))
++			end := string(dreq.RangeEnd)
++			if end == "\x00" {
++				// "\x00" means "to the end of the keyspace"; StringAffine uses "" for +inf.
++				end = ""
++			}
++			iv = adt.NewStringAffineInterval(string(dreq.Key), end)
+ 		} else {
+ 			iv = adt.NewStringAffinePoint(string(dreq.Key))
+ 		}

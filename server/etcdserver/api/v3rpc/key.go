@@ -248,7 +248,12 @@ func checkIntervals(reqs []*pb.RequestOp) (map[string]struct{}, adt.IntervalTree
 		}
 		var iv adt.Interval
 		if len(dreq.RangeEnd) != 0 {
-			iv = adt.NewStringAffineInterval(string(dreq.Key), string(dreq.RangeEnd))
+			end := string(dreq.RangeEnd)
+			if end == "\x00" {
+				// "\x00" means "to the end of the keyspace"; StringAffine uses "" for +inf.
+				end = ""
+			}
+			iv = adt.NewStringAffineInterval(string(dreq.Key), end)
 		} else {
 			iv = adt.NewStringAffinePoint(string(dreq.Key))
 		}
