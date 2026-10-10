@@ -110,6 +110,54 @@ docker exec etcd-workload python3 /tmp/r.py          # all 3 members exit 2
 # repro_compact_revpair.py                           # member serving the read exits 1
 ```
 
+## Version history (bisected locally, 2026-10-10)
+
+Tested on a fresh single-member cluster per version, with no Antithesis and no
+faults. Released versions came from `gcr.io/etcd-development/etcd` images or
+GitHub release tarballs. Old `main` commits were built from source (Go 1.8.7
+for the 2017 commits, local Go for 2024). Crash = the member exits.
+
+| Release | `repro_put_ignore_value.py` (panic) | `repro_compact_revpair.py` (fatal) |
+|---|---|---|
+| v3.0.17, v3.1.0, v3.1.24 | no crash* | no crash |
+| v3.2.0, v3.2.4, v3.2.32, v3.3.0, v3.3.27 | **exit 2** | no crash |
+| v3.4.0 … v3.4.33 | **exit 2** | no crash |
+| v3.4.34, v3.4.45 | **exit 2** | **exit 1** |
+| v3.5.0 … v3.5.15 | **exit 2** | no crash |
+| v3.5.16, v3.5.17, v3.5.34 | **exit 2** | **exit 1** |
+| v3.6.0, v3.6.15, v3.7.2 | **exit 2** | **exit 1** |
+
+\* v3.0/v3.1 still accept the bad txn (the delete covers key05 and the put
+re-creates it at the same revision), but they don't know `ignore_value`. The
+server drops the field and writes an empty value, so nothing can fail at apply
+time.
+
+Commits involved (all on `main`):
+
+1. **Validation hole, `4fc89678b` (2016-02-18), "etcdserver: add >= support
+   for v3 delete range".** It made `range_end="\x00"` mean "≥ key" for
+   DeleteRange at apply time. It did not update the duplicate-key check
+   (`checkRequestDupKeys`, from `c5c5063ef`). That check still treats `"\x00"`
+   as a literal end, so a from-key delete overlaps nothing. `6ed51dc62`
+   (nested txns, 2017-06) rewrote the check as `checkIntervals` and kept the
+   hole. Found by reading the code, not by a build.
+2. **Panic, `8752ee52a` (2016-12-05; merged in PR #6894 on 2017-01-13),
+   "etcdserver: use prev-value for ignore_value writes".** The first way to
+   make a txn put fail at apply time (`ErrKeyNotFound`), which then hits the
+   "unexpected error during txn" panic. Verified by building: `7f8b5774a` (its
+   parent's parent) doesn't crash, and `8752ee52a` crashes. The parent,
+   `e655420d3`, doesn't build on its own. `8a87769a0` (2017-01-25, the
+   `ignore_lease` change) adds the second path, also verified with builds on
+   each side. First affected release: **v3.2.0**.
+3. **Compaction fatal, `bbdc94181` (2024-07-04; PR #18274), "*: keep tombstone
+   if revision == compactAtRev".** It changed `doCompact` to stop at a
+   generation whose tombstone equals `atRev` (`>` became `>=`). With a
+   delete and a put at the same main revision, that is the old generation, so
+   `{R,1}` in the new generation never goes into the keep set and the backend
+   deletes it. Verified by building: `bbdc94181^` doesn't crash and `bbdc94181`
+   does. Backported as #18474 / #18475. First affected releases: **v3.5.16,
+   v3.4.34** (and every v3.6+).
+
 ## Fix (applied to this checkout on 2026-10-10)
 
 Applied in `server/etcdserver/api/v3rpc/key.go` (same change as
