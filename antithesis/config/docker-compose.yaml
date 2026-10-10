@@ -1,0 +1,106 @@
+name: etcd
+
+x-etcd-env: &etcd-env
+  NO_COLOR: "1"
+  ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
+  ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+  ETCD_INITIAL_CLUSTER_TOKEN: "etcd-antithesis"
+  ETCD_INITIAL_CLUSTER: "etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380"
+  ETCD_INITIAL_CLUSTER_STATE: "new"
+  ETCD_DATA_DIR: "/var/etcd/data"
+  # From tests/antithesis upstream: make snapshots, snapshot catch-up and
+  # batched compaction common.
+  ETCD_SNAPSHOT_COUNT: "50"
+  ETCD_SNAPSHOT_CATCHUP_ENTRIES: "100"
+  ETCD_COMPACTION_BATCH_LIMIT: "10"
+
+x-etcd: &etcd
+  platform: linux/amd64
+  init: true
+  image: etcd-server:latest
+  volumes:
+    - sut-logs:/logs
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "--command-timeout=2s", "endpoint", "health"]
+    interval: 2s
+    timeout: 5s
+    retries: 90
+
+services:
+  etcd0:
+    <<: *etcd
+    # Only etcd0 builds the shared image; building it from all three services
+    # races on the tag ("image already exists").
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: etcd
+    container_name: etcd0
+    hostname: etcd0
+    entrypoint: ["/usr/local/bin/log-tee.sh", "etcd0"]
+    command: ["/usr/local/bin/etcd"]
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: "etcd0"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd0:2380"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd0:2379"
+
+  etcd1:
+    <<: *etcd
+    container_name: etcd1
+    hostname: etcd1
+    entrypoint: ["/usr/local/bin/log-tee.sh", "etcd1"]
+    command: ["/usr/local/bin/etcd"]
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: "etcd1"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd1:2380"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd1:2379"
+
+  etcd2:
+    <<: *etcd
+    container_name: etcd2
+    hostname: etcd2
+    entrypoint: ["/usr/local/bin/log-tee.sh", "etcd2"]
+    command: ["/usr/local/bin/etcd"]
+    environment:
+      <<: *etcd-env
+      ETCD_NAME: "etcd2"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd2:2380"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd2:2379"
+
+  workload:
+    container_name: etcd-workload
+    hostname: etcd-workload
+    platform: linux/amd64
+    init: true
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: workload
+    image: etcd-workload:latest
+    environment:
+      NO_COLOR: "1"
+      ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    depends_on:
+      etcd0:
+        condition: service_healthy
+      etcd1:
+        condition: service_healthy
+      etcd2:
+        condition: service_healthy
+
+  sidecar:
+    container_name: etcd-sidecar
+    hostname: etcd-sidecar
+    platform: linux/amd64
+    init: true
+    build: ../sidecar
+    image: etcd-sidecar:latest
+    environment:
+      NO_COLOR: "1"
+    volumes:
+      - sut-logs:/logs
+
+volumes:
+  sut-logs:

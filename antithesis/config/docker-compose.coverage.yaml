@@ -1,0 +1,48 @@
+# LOCAL ONLY. Never used for Antithesis runs or `snouty validate`.
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.coverage.yaml ...
+# (antithesis/local/run-local.sh does this).
+#
+# Builds etcd with `go build -cover` under a separate tag, so the instrumented
+# etcd-server:latest that Antithesis uses is never overwritten.
+#
+# init: false is deliberate. etcd's SIGTERM handler (pkg/osutil/interrupt_unix.go)
+# re-raises the signal and dies by it, which skips Go's coverage flush, *unless*
+# etcd is PID 1, in which case it calls os.Exit(0) and the counters are written.
+# log-tee.sh execs etcd, so without an init process etcd ends up as PID 1.
+
+x-etcd-coverage: &etcd-coverage
+  image: etcd-server:coverage
+  init: false
+  command: ["/bin/sh", "-c", "mkdir -p \"$$GOCOVERDIR\" && exec /usr/local/bin/etcd"]
+
+services:
+  etcd0:
+    <<: *etcd-coverage
+    build:
+      args:
+        COVERAGE: "1"
+    environment:
+      GOCOVERDIR: /coverage/etcd0
+    volumes:
+      - coverage:/coverage
+  etcd1:
+    <<: *etcd-coverage
+    environment:
+      GOCOVERDIR: /coverage/etcd1
+    volumes:
+      - coverage:/coverage
+  etcd2:
+    <<: *etcd-coverage
+    environment:
+      GOCOVERDIR: /coverage/etcd2
+    volumes:
+      - coverage:/coverage
+
+  workload:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /logs/sdk-workload.jsonl
+    volumes:
+      - sut-logs:/logs
+
+volumes:
+  coverage:

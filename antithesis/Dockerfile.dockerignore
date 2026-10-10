@@ -1,0 +1,6 @@
+.git
+bin
+antithesis/local
+antithesis/scratchbook
+**/*.test
+**/*.coverprofile
