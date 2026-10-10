@@ -158,12 +158,43 @@ Commits involved (all on `main`):
    does. Backported as #18474 / #18475. First affected releases: **v3.5.16,
    v3.4.34** (and every v3.6+).
 
+## Prior reports upstream (searched 2026-10-10)
+
+Searched with the public GitHub search API (issues + PRs in etcd-io/etcd) for
+the crash messages, `checkIntervals`, `duplicate key given in txn request`,
+`WithFromKey txn`, `ignore_value`/`ignore_lease` + panic, and `failed Put`.
+Private security advisories can't be searched. Result: **two of the three
+pieces are already known; the most severe consequence apparently isn't.**
+
+| Piece | Upstream | State |
+|---|---|---|
+| Root cause: `checkIntervals` ignores the `"\x00"` sentinel | PR **#22395** "detect txn overlap for open-ended delete ranges" (2026-09-08); dup issue #22445 + PR #22446 (2026-09-18, closed as dup) | open, not merged, no maintainer review beyond `/ok-to-test`. Upstream `main` still has the bug. Same fix as ours |
+| Compaction consequence ("range failed to find revision pair", run 3) | issue **#22376** + PR **#22377** (2026-09-03), blamed on #18274, same commit as the bisection | open; PR needs rebase. #22376 also reports that after a **restart** the member comes back with an **empty keyspace** and reports healthy (silent data loss), which we didn't test |
+| **All-member panic + crash loop** via `ignore_value`/`ignore_lease` (run 4), every release since v3.2.0 | **no report found** | — |
+
+That third row matters because #22395 judges its bug **"not a security fix
+… the same effect is reachable with two separate calls. It is a correctness
+bug."** That holds for a plain put, but not for `ignore_value`/`ignore_lease`:
+as two separate calls, the put is cleanly rejected (`key not found`). Inside
+one txn it passes the checks and, once committed, panics every member on
+apply and again on every restart. So one client request permanently takes
+down the whole cluster: a denial of service the PR's assessment doesn't
+cover. Suggested route: report the panic privately through
+https://github.com/etcd-io/etcd/security/advisories/new, pointing at #22395
+as the fix and at the repro here, rather than commenting on the public PR.
+
+Related, mentioned in #22445 but not checked here: the grpc-proxy range cache
+has the same `"\x00"` sentinel bug (#22397 / #22398).
+
 ## Fix (applied to this checkout on 2026-10-10)
 
 Applied in `server/etcdserver/api/v3rpc/key.go` (same change as
 `repro/candidate-fix.diff`); the existing `v3rpc` unit tests pass. Re-run on
 the rebuilt instrumented image: both repros are rejected and all members stay
-healthy. Antithesis run with the fix: `a9d5dfcdfd77505dcc64d343f436d807-64-0`.
+healthy. Antithesis run with the fix: `a9d5dfcdfd77505dcc64d343f436d807-64-0`
+(30 min, same drivers as run 4): **every property passes, including "No
+unexpected container exits"; zero panics and zero fatals in any timeline**
+(run 4: 22 panics, 21 container exits).
 Originally: in `checkIntervals`, treat `range_end == "\x00"`
 as unbounded (`""`) when building the delete interval. Built in a scratch copy
 and run against every repro above: each txn is rejected with `INVALID_ARGUMENT:
